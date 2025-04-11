@@ -50,6 +50,18 @@ class SpeechRequest(BaseModel):
     speed: float = 1.0
 
 
+class Model(BaseModel):
+    id: str
+    created: int
+    object: str = "model"
+    owned_by: str
+
+
+class ListModelsResponse(BaseModel):
+    object: str = "list"
+    data: list[Model]
+
+
 def create_wav_header(sample_rate: int, channels: int, sample_width: int) -> bytes:
     """Creates a WAV header with placeholder sizes."""
     # Using BytesIO to build the header in memory
@@ -64,6 +76,18 @@ def create_wav_header(sample_rate: int, channels: int, sample_width: int) -> byt
     wf.writeframes(b"")
     wf.close()  # Close the wave writer *before* getting the value
     return f.getvalue()
+
+
+# Get process start time in seconds since epoch
+process_start_time = int(time.time())
+
+
+@app.get("/v1/models")
+async def list_models():
+    model_name = os.environ.get("ORPHEUS_MODEL_NAME", "Orpheus-3b-FT-Q8_0.gguf")
+    return ListModelsResponse(
+        data=[Model(id=model_name, created=process_start_time, owned_by="inferix")]
+    )
 
 
 # OpenAI-compatible API endpoint
