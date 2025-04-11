@@ -19,21 +19,6 @@ from dotenv import load_dotenv
 # Import the unified token handling from speechpipe
 from speechpipe import turn_token_into_id
 
-
-# Helper to detect if running in Uvicorn's reloader
-def is_reloader_process():
-    """Check if the current process is a uvicorn reloader"""
-    return (
-        sys.argv[0].endswith("_continuation.py")
-        or os.environ.get("UVICORN_STARTED") == "true"
-    )
-
-
-# Set a flag to avoid repeat messages
-IS_RELOADER = is_reloader_process()
-if not IS_RELOADER:
-    os.environ["UVICORN_STARTED"] = "true"
-
 # Load environment variables from .env file
 load_dotenv()
 
@@ -55,30 +40,27 @@ if torch.cuda.is_available():
     )
 
     if HIGH_END_GPU:
-        if not IS_RELOADER:
-            print("🖥️ Hardware: High-end CUDA GPU detected")
-            print(f"📊 Device: {gpu_name}")
-            print(f"📊 VRAM: {gpu_mem_gb:.2f} GB")
-            print(f"📊 Compute Capability: {compute_capability}")
-            print("🚀 Using high-performance optimizations")
+        print("🖥️ Hardware: High-end CUDA GPU detected")
+        print(f"📊 Device: {gpu_name}")
+        print(f"📊 VRAM: {gpu_mem_gb:.2f} GB")
+        print(f"📊 Compute Capability: {compute_capability}")
+        print("🚀 Using high-performance optimizations")
     else:
-        if not IS_RELOADER:
-            print("🖥️ Hardware: CUDA GPU detected")
-            print(f"📊 Device: {gpu_name}")
-            print(f"📊 VRAM: {gpu_mem_gb:.2f} GB")
-            print(f"📊 Compute Capability: {compute_capability}")
-            print("🚀 Using GPU-optimized settings")
+        print("🖥️ Hardware: CUDA GPU detected")
+        print(f"📊 Device: {gpu_name}")
+        print(f"📊 VRAM: {gpu_mem_gb:.2f} GB")
+        print(f"📊 Compute Capability: {compute_capability}")
+        print("🚀 Using GPU-optimized settings")
 else:
     # Get CPU info
     cpu_cores = psutil.cpu_count(logical=False)
     cpu_threads = psutil.cpu_count(logical=True)
     ram_gb = psutil.virtual_memory().total / (1024**3)
 
-    if not IS_RELOADER:
-        print("🖥️ Hardware: CPU only (No CUDA GPU detected)")
-        print(f"📊 CPU: {cpu_cores} cores, {cpu_threads} threads")
-        print(f"📊 RAM: {ram_gb:.2f} GB")
-        print("⚙️ Using CPU-optimized settings")
+    print("🖥️ Hardware: CPU only (No CUDA GPU detected)")
+    print(f"📊 CPU: {cpu_cores} cores, {cpu_threads} threads")
+    print(f"📊 RAM: {ram_gb:.2f} GB")
+    print("⚙️ Using CPU-optimized settings")
 
 # Load configuration from environment variables without hardcoded defaults
 # Critical settings - will log errors if missing
@@ -133,13 +115,12 @@ except (ValueError, TypeError):
     SAMPLE_RATE = 24000
 
 # Print loaded configuration only in the main process, not in the reloader
-if not IS_RELOADER:
-    print("Configuration loaded:")
-    print(f"  API_URL: {API_URL}")
-    print(f"  MAX_TOKENS: {MAX_TOKENS}")
-    print(f"  TEMPERATURE: {TEMPERATURE}")
-    print(f"  TOP_P: {TOP_P}")
-    print(f"  REPETITION_PENALTY: {REPETITION_PENALTY}")
+print("Configuration loaded:")
+print(f"  API_URL: {API_URL}")
+print(f"  MAX_TOKENS: {MAX_TOKENS}")
+print(f"  TEMPERATURE: {TEMPERATURE}")
+print(f"  TOP_P: {TOP_P}")
+print(f"  REPETITION_PENALTY: {REPETITION_PENALTY}")
 
 # Parallel processing settings
 NUM_WORKERS = 4 if HIGH_END_GPU else 2

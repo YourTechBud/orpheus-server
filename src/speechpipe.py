@@ -1,7 +1,5 @@
 import asyncio
-import os
 import queue
-import sys
 import threading
 import time
 from typing import AsyncGenerator
@@ -10,26 +8,12 @@ import numpy as np
 import torch
 from snac import SNAC
 
-
-# Helper to detect if running in Uvicorn's reloader (same as in inference.py)
-def is_reloader_process():
-    """Check if the current process is a uvicorn reloader"""
-    return (
-        sys.argv[0].endswith("_continuation.py")
-        or os.environ.get("UVICORN_STARTED") == "true"
-    )
-
-
-# Set a flag to avoid repeat messages
-IS_RELOADER = is_reloader_process()
-
 # Try to enable torch.compile if PyTorch 2.0+ is available
 TORCH_COMPILE_AVAILABLE = False
 try:
     if hasattr(torch, "compile"):
         TORCH_COMPILE_AVAILABLE = True
-        if not IS_RELOADER:
-            print("PyTorch 2.0+ detected, torch.compile is available")
+        print("PyTorch 2.0+ detected, torch.compile is available")
 except Exception as e:
     print(f"Error checking torch.compile: {e}")
     pass
@@ -39,8 +23,7 @@ CUDA_GRAPHS_AVAILABLE = False
 try:
     if torch.cuda.is_available() and hasattr(torch.cuda, "make_graphed_callables"):
         CUDA_GRAPHS_AVAILABLE = True
-        if not IS_RELOADER:
-            print("CUDA graphs support is available")
+        print("CUDA graphs support is available")
 except Exception as e:
     print(f"Error checking CUDA graphs: {e}")
     pass
@@ -55,21 +38,19 @@ snac_device = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
-if not IS_RELOADER:
-    print(f"Using device: {snac_device}")
+print(f"Using device: {snac_device}")
 model = model.to(snac_device)
 
-# Disable torch.compile as it requires Triton which isn't installed
-# We'll use regular PyTorch optimization techniques instead
-if not IS_RELOADER:
-    print("Using standard PyTorch optimizations (torch.compile disabled)")
+# # Disable torch.compile as it requires Triton which isn't installed
+# # We'll use regular PyTorch optimization techniques instead
+# if not IS_RELOADER:
+#     print("Using standard PyTorch optimizations (torch.compile disabled)")
 
 # Prepare CUDA streams for parallel processing if available
 cuda_stream = None
 if snac_device == "cuda":
     cuda_stream = torch.cuda.Stream()
-    if not IS_RELOADER:
-        print("Using CUDA stream for parallel processing")
+    print("Using CUDA stream for parallel processing")
 
 
 def convert_to_audio(multiframe, count):
