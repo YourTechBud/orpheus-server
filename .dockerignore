@@ -1,0 +1,32 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# Output files
+out.wav
+*.wav
+
+# IDE
+.idea/
+.vscode/
+
+# Misc
+.DS_Store
+Dockerfile
+.dockerignore
+README.md
