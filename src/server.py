@@ -1,6 +1,7 @@
 import asyncio
 import io
 import os
+import time
 import wave
 
 from dotenv import load_dotenv
@@ -80,6 +81,8 @@ async def create_speech_api(request: SpeechRequest):
 
     # Create a queue to buffer audio chunks between generation and streaming
     audio_queue = asyncio.Queue()  # Default infinite size
+    all_audio_segments = []
+    start_time = time.time()
 
     # Define the audio generation task (producer)
     async def audio_producer():
@@ -130,6 +133,7 @@ async def create_speech_api(request: SpeechRequest):
                 break  # End of audio data
             # print(f"Yielding audio chunk ({len(chunk)} bytes)...") # Can be noisy
             yield chunk
+            all_audio_segments.append(chunk)
             # Mark task as done (important if using queue.join())
             audio_queue.task_done()
 
@@ -140,6 +144,23 @@ async def create_speech_api(request: SpeechRequest):
         except Exception as e:
             print(f"Producer task finished with error: {e}")
             # Handle error if needed (e.g., log it), although stream already ended.
+
+        # Report final performance metrics
+        end_time = time.time()
+        total_time = end_time - start_time
+        print(f"Total speech generation completed in {total_time:.2f} seconds")
+
+        # Calculate combined duration
+        if all_audio_segments:
+            total_bytes = sum(len(segment) for segment in all_audio_segments)
+            duration = total_bytes / (2 * SAMPLE_RATE)  # 2 bytes per sample at 24kHz
+            print(f"Generated {len(all_audio_segments)} audio segments")
+            print(
+                f"Generated {duration:.2f} seconds of audio in {total_time:.2f} seconds"
+            )
+            print(f"Realtime factor: {duration/total_time:.2f}x")
+
+        print(f"Total speech generation completed in {total_time:.2f} seconds")
 
     # Return the streaming response
     return StreamingResponse(
