@@ -1,13 +1,16 @@
-import asyncio
+import io
 import os
-import queue
 import threading
 import time
-from typing import AsyncGenerator, List, Optional
+import wave
+from typing import List, Optional
 
 import numpy as np
 import torch
+from dotenv import load_dotenv
 from snac import SNAC
+
+load_dotenv()
 
 # Try to enable torch.compile if PyTorch 2.0+ is available
 TORCH_COMPILE_AVAILABLE = False
@@ -96,102 +99,103 @@ MODEL_POOL_SIZE = int(os.environ.get("MODEL_POOL_SIZE", "10"))
 model_pool = ModelPool(size=MODEL_POOL_SIZE)
 
 
-def convert_to_audio(multiframe, count, model_index=None):
+def create_wav_header(sample_rate: int, channels: int, sample_width: int) -> bytes:
+    """Creates a WAV header with placeholder sizes."""
+    # Using BytesIO to build the header in memory
+    f = io.BytesIO()
+    wf = wave.open(f, "wb")
+    wf.setnchannels(channels)
+    wf.setsampwidth(sample_width)
+    wf.setframerate(sample_rate)
+    # Write 0 frames - this forces wave module to write the header structure
+    # The chunk sizes (RIFF overall size, data chunk size) will be placeholders
+    # like 0 or a small default, which is often sufficient for streaming players.
+    wf.writeframes(b"")
+    wf.close()  # Close the wave writer *before* getting the value
+    return f.getvalue()
+
+
+def convert_to_audio(multiframe, count, model_index):
     """
     Optimized version of convert_to_audio that eliminates inefficient tensor operations
     and reduces CPU-GPU transfers for much faster inference on high-end GPUs.
-
-    Args:
-        multiframe: The frame data to convert
-        count: The frame count
-        model_index: Optional model index to use from the pool. If None, selects one automatically.
     """
+
+    model = model_pool.models[model_index]
+    cuda_stream = model_pool.cuda_streams[model_index]
+
     if len(multiframe) < 7:
         return None
 
-    # Get a model from the pool
-    if model_index is None:
-        model_index, model, lock, cuda_stream = model_pool.get_model()
-    else:
-        model = model_pool.models[model_index]
-        lock = model_pool.locks[model_index]
-        cuda_stream = model_pool.cuda_streams[model_index]
+    num_frames = len(multiframe) // 7
+    frame = multiframe[: num_frames * 7]
 
-    try:
-        num_frames = len(multiframe) // 7
-        frame = multiframe[: num_frames * 7]
+    # Pre-allocate tensors instead of incrementally building them
+    codes_0 = torch.zeros(num_frames, dtype=torch.int32, device=snac_device)
+    codes_1 = torch.zeros(num_frames * 2, dtype=torch.int32, device=snac_device)
+    codes_2 = torch.zeros(num_frames * 4, dtype=torch.int32, device=snac_device)
 
-        # Pre-allocate tensors instead of incrementally building them
-        codes_0 = torch.zeros(num_frames, dtype=torch.int32, device=snac_device)
-        codes_1 = torch.zeros(num_frames * 2, dtype=torch.int32, device=snac_device)
-        codes_2 = torch.zeros(num_frames * 4, dtype=torch.int32, device=snac_device)
+    # Use vectorized operations where possible
+    frame_tensor = torch.tensor(frame, dtype=torch.int32, device=snac_device)
 
-        # Use vectorized operations where possible
-        frame_tensor = torch.tensor(frame, dtype=torch.int32, device=snac_device)
+    # Direct indexing is much faster than concatenation in a loop
+    for j in range(num_frames):
+        idx = j * 7
 
-        # Direct indexing is much faster than concatenation in a loop
-        for j in range(num_frames):
-            idx = j * 7
+        # Code 0 - single value per frame
+        codes_0[j] = frame_tensor[idx]
 
-            # Code 0 - single value per frame
-            codes_0[j] = frame_tensor[idx]
+        # Code 1 - two values per frame
+        codes_1[j * 2] = frame_tensor[idx + 1]
+        codes_1[j * 2 + 1] = frame_tensor[idx + 4]
 
-            # Code 1 - two values per frame
-            codes_1[j * 2] = frame_tensor[idx + 1]
-            codes_1[j * 2 + 1] = frame_tensor[idx + 4]
+        # Code 2 - four values per frame
+        codes_2[j * 4] = frame_tensor[idx + 2]
+        codes_2[j * 4 + 1] = frame_tensor[idx + 3]
+        codes_2[j * 4 + 2] = frame_tensor[idx + 5]
+        codes_2[j * 4 + 3] = frame_tensor[idx + 6]
 
-            # Code 2 - four values per frame
-            codes_2[j * 4] = frame_tensor[idx + 2]
-            codes_2[j * 4 + 1] = frame_tensor[idx + 3]
-            codes_2[j * 4 + 2] = frame_tensor[idx + 5]
-            codes_2[j * 4 + 3] = frame_tensor[idx + 6]
+    # Reshape codes into expected format
+    codes = [codes_0.unsqueeze(0), codes_1.unsqueeze(0), codes_2.unsqueeze(0)]
 
-        # Reshape codes into expected format
-        codes = [codes_0.unsqueeze(0), codes_1.unsqueeze(0), codes_2.unsqueeze(0)]
+    # Check tokens are in valid range
+    if (
+        torch.any(codes[0] < 0)
+        or torch.any(codes[0] > 4096)
+        or torch.any(codes[1] < 0)
+        or torch.any(codes[1] > 4096)
+        or torch.any(codes[2] < 0)
+        or torch.any(codes[2] > 4096)
+    ):
+        return None
 
-        # Check tokens are in valid range
-        if (
-            torch.any(codes[0] < 0)
-            or torch.any(codes[0] > 4096)
-            or torch.any(codes[1] < 0)
-            or torch.any(codes[1] > 4096)
-            or torch.any(codes[2] < 0)
-            or torch.any(codes[2] > 4096)
-        ):
-            return None
+    # Use CUDA stream for parallel processing if available
+    stream_ctx = (
+        torch.cuda.stream(cuda_stream) if cuda_stream is not None else torch.no_grad()
+    )
 
-        # Use CUDA stream for parallel processing if available
-        stream_ctx = (
-            torch.cuda.stream(cuda_stream)
-            if cuda_stream is not None
-            else torch.no_grad()
-        )
+    with stream_ctx, torch.inference_mode():
+        # Decode the audio
+        audio_hat = model.decode(codes)
 
-        with lock, stream_ctx, torch.inference_mode():
-            # Decode the audio
-            audio_hat = model.decode(codes)
+        # Extract the relevant slice and efficiently convert to bytes
+        # Keep data on GPU as long as possible
+        audio_slice = audio_hat[:, :, 2048:4096]
 
-            # Extract the relevant slice and efficiently convert to bytes
-            # Keep data on GPU as long as possible
-            audio_slice = audio_hat[:, :, 2048:4096]
+        # Process on GPU if possible, with minimal data transfer
+        if snac_device == "cuda":
+            # Scale directly on GPU
+            audio_int16_tensor = (audio_slice * 32767).to(torch.int16)
+            # Only transfer the final result to CPU
+            audio_bytes = audio_int16_tensor.cpu().numpy().tobytes()
+        else:
+            # For non-CUDA devices, fall back to the original approach
+            detached_audio = audio_slice.detach().cpu()
+            audio_np = detached_audio.numpy()
+            audio_int16 = (audio_np * 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
 
-            # Process on GPU if possible, with minimal data transfer
-            if snac_device == "cuda":
-                # Scale directly on GPU
-                audio_int16_tensor = (audio_slice * 32767).to(torch.int16)
-                # Only transfer the final result to CPU
-                audio_bytes = audio_int16_tensor.cpu().numpy().tobytes()
-            else:
-                # For non-CUDA devices, fall back to the original approach
-                detached_audio = audio_slice.detach().cpu()
-                audio_np = detached_audio.numpy()
-                audio_int16 = (audio_np * 32767).astype(np.int16)
-                audio_bytes = audio_int16.tobytes()
-
-        return audio_bytes
-    finally:
-        # Release the model back to the pool
-        model_pool.release_model(model_index)
+    return audio_bytes
 
 
 # Define the custom token prefix
@@ -246,238 +250,3 @@ def turn_token_into_id(token_string, index):
         return token_id
     except (ValueError, IndexError):
         return None
-
-
-async def tokens_decoder(token_gen) -> AsyncGenerator[bytes, None]:
-    """Optimized token decoder with early first-chunk processing for lower latency"""
-    buffer = []
-    count = 0
-
-    # Get a model from the pool
-    model_index, _, _, _ = model_pool.get_model()
-
-    try:
-        # Track if first chunk has been processed
-        first_chunk_processed = False
-
-        # Use different thresholds for first chunk vs. subsequent chunks
-        min_frames_first = (
-            7  # Just one chunk (7 tokens) for first audio - ultra-low latency
-        )
-        min_frames_subsequent = (
-            28  # Standard minimum (4 chunks of 7 tokens) after first audio
-        )
-        ideal_frames = 49  # Ideal standard frame size (7×7 window) - unchanged
-        process_every_n = (
-            7  # Process every 7 tokens (standard for Orpheus model) - unchanged
-        )
-
-        start_time = time.time()
-        token_count = 0
-        last_log_time = start_time
-
-        async for token_sim in token_gen:
-            token_count += 1
-
-            # Use the unified turn_token_into_id which already handles caching
-            token = turn_token_into_id(token_sim, count)
-
-            if token is not None and token > 0:
-                buffer.append(token)
-                count += 1
-
-                # Log throughput periodically
-                current_time = time.time()
-                if current_time - last_log_time > 5.0:  # Every 5 seconds
-                    elapsed = current_time - last_log_time
-                    if elapsed > 0:
-                        recent_tokens = token_count
-                        tokens_per_sec = recent_tokens / elapsed
-                        print(
-                            f"Token processing rate: {tokens_per_sec:.1f} tokens/second"
-                        )
-                    last_log_time = current_time
-                    token_count = 0
-
-                # Different processing logic based on whether first chunk has been processed
-                if not first_chunk_processed:
-                    # Process first chunk as soon as possible for minimal latency
-                    if count >= min_frames_first:
-                        buffer_to_proc = buffer[-min_frames_first:]
-
-                        # Process the first chunk of audio for immediate feedback
-                        print(
-                            f"Processing first audio chunk with {len(buffer_to_proc)} tokens for low latency"
-                        )
-                        audio_samples = convert_to_audio(
-                            buffer_to_proc, count, model_index=model_index
-                        )
-                        if audio_samples is not None:
-                            first_chunk_processed = (
-                                True  # Mark first chunk as processed
-                            )
-                            yield audio_samples
-                else:
-                    # For subsequent chunks, use original processing with proper batching
-                    if count % process_every_n == 0:
-                        # Determine how many frames to process
-                        frames_to_process = min(ideal_frames, len(buffer))
-                        if frames_to_process >= min_frames_subsequent:
-                            buffer_to_proc = buffer[-frames_to_process:]
-                            audio_samples = convert_to_audio(
-                                buffer_to_proc, count, model_index=model_index
-                            )
-                            if audio_samples is not None:
-                                yield audio_samples
-
-        # CRITICAL: End-of-generation handling - process all remaining frames
-        # Process remaining complete frames (ideal size)
-        if len(buffer) >= ideal_frames:
-            buffer_to_proc = buffer[-ideal_frames:]
-            audio_samples = convert_to_audio(
-                buffer_to_proc, count, model_index=model_index
-            )
-            if audio_samples is not None:
-                yield audio_samples
-
-        # Process any additional complete frames (minimum size)
-        elif len(buffer) >= min_frames_subsequent:
-            buffer_to_proc = buffer[-min_frames_subsequent:]
-            audio_samples = convert_to_audio(
-                buffer_to_proc, count, model_index=model_index
-            )
-            if audio_samples is not None:
-                yield audio_samples
-
-        # Final special case: even if we don't have minimum frames, try to process
-        # what we have by padding with silence tokens that won't affect the audio
-        elif len(buffer) >= process_every_n:
-            # Pad to minimum frame requirement with copies of the final token
-            # This is more continuous than using unrelated tokens from the beginning
-            last_token = buffer[-1]
-            padding_needed = min_frames_subsequent - len(buffer)
-
-            # Create a padding array of copies of the last token
-            # This maintains continuity much better than circular buffering
-            padding = [last_token] * padding_needed
-            padded_buffer = buffer + padding
-
-            print(
-                f"Processing final partial frame: {len(buffer)} tokens + {padding_needed} repeated-token padding"
-            )
-            audio_samples = convert_to_audio(
-                padded_buffer, count, model_index=model_index
-            )
-            if audio_samples is not None:
-                yield audio_samples
-    finally:
-        # Release the model back to the pool
-        model_pool.release_model(model_index)
-
-
-# ------------------ Synchronous Tokens Decoder Wrapper ------------------ #
-def tokens_decoder_sync(syn_token_gen, output_file=None):
-    """Optimized synchronous decoder with larger queue and parallel processing"""
-    # Use a larger queue for RTX 4090 to maximize GPU utilization
-    max_queue_size = 32 if snac_device == "cuda" else 8
-    audio_queue = queue.Queue(maxsize=max_queue_size)
-    audio_segments = []  # Store all segments for potential file output
-
-    # Collect tokens in batches for higher throughput
-    batch_size = 16 if snac_device == "cuda" else 4
-
-    # Convert the synchronous token generator into an async generator with batching
-    async def async_token_gen():
-        token_batch = []
-        for token in syn_token_gen:
-            token_batch.append(token)
-            # Process in batches for efficiency
-            if len(token_batch) >= batch_size:
-                for t in token_batch:
-                    yield t
-                token_batch = []
-        # Process any remaining tokens
-        for t in token_batch:
-            yield t
-
-    async def async_producer():
-        # Start timer for performance logging
-        start_time = time.time()
-        chunk_count = 0
-
-        try:
-            # Process audio chunks from the token decoder
-            async for audio_chunk in tokens_decoder(async_token_gen()):
-                if audio_chunk:  # Validate audio chunk before adding to queue
-                    audio_queue.put(audio_chunk)
-                    audio_segments.append(
-                        audio_chunk
-                    )  # Store for file output if needed
-                    chunk_count += 1
-
-                    # Log performance stats periodically
-                    if chunk_count % 10 == 0:
-                        elapsed = time.time() - start_time
-                        print(
-                            f"Generated {chunk_count} chunks in {elapsed:.2f}s ({chunk_count/elapsed:.2f} chunks/sec)"
-                        )
-        except Exception as e:
-            print(f"Error in audio producer: {e}")
-            import traceback
-
-            traceback.print_exc()
-        finally:
-            # Signal completion
-            print("Audio producer completed - finalizing all chunks")
-            audio_queue.put(None)  # Sentinel
-
-    def run_async():
-        asyncio.run(async_producer())
-
-    # Use a higher priority thread for RTX 4090 to ensure it stays fed with work
-    thread = threading.Thread(target=run_async)
-    thread.daemon = True  # Allow the thread to be terminated when the main thread exits
-    thread.start()
-
-    # Use larger buffer for final audio assembly
-    buffer_size = 5
-    audio_buffer = []
-    result_segments = []  # Store all segments for return
-
-    while True:
-        audio = audio_queue.get()
-        if audio is None:
-            break
-
-        audio_buffer.append(audio)
-        # Collect for return
-        result_segments.append(audio)
-
-        # Yield buffered audio chunks for smoother playback
-        if len(audio_buffer) >= buffer_size:
-            for chunk in audio_buffer:
-                yield chunk
-            audio_buffer = []
-
-    # Yield any remaining audio in the buffer
-    for chunk in audio_buffer:
-        yield chunk
-
-    thread.join()
-
-    # If output file provided, write all audio segments to WAV file
-    if output_file and audio_segments:
-        import wave
-
-        wav_file = wave.open(output_file, "wb")
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(24000)  # Use the sample rate from inference.py
-
-        for segment in audio_segments:
-            wav_file.writeframes(segment)
-
-        wav_file.close()
-        print(f"Audio saved to {output_file}")
-
-    return result_segments

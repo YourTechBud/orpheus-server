@@ -17,7 +17,7 @@ import torch
 from dotenv import load_dotenv
 
 # Import the unified token handling from speechpipe
-from speechpipe import turn_token_into_id
+from speechpipe import create_wav_header, model_pool, turn_token_into_id
 
 # Load environment variables from .env file
 load_dotenv()
@@ -465,13 +465,15 @@ def generate_tokens_from_api(
 # This eliminates duplicate code and ensures consistent behavior
 
 
-def convert_to_audio(multiframe: List[int], count: int) -> Optional[bytes]:
+def convert_to_audio(
+    multiframe: List[int], count: int, model_index: int
+) -> Optional[bytes]:
     """Convert token frames to audio with performance monitoring."""
     # Import here to avoid circular imports
     from speechpipe import convert_to_audio as orpheus_convert_to_audio
 
     _start_time = time.time()
-    result = orpheus_convert_to_audio(multiframe, count)
+    result = orpheus_convert_to_audio(multiframe, count, model_index)
 
     if result is not None:
         perf_monitor.add_audio_chunk()
@@ -484,68 +486,79 @@ async def tokens_decoder(token_gen) -> AsyncGenerator[bytes, None]:
     buffer = []
     count = 0
 
-    # Use different thresholds for first chunk vs. subsequent chunks
-    first_chunk_processed = False
-    min_frames_first = (
-        7  # Process after just 7 tokens for first chunk (ultra-low latency)
-    )
-    min_frames_subsequent = (
-        28  # Default for reliability after first chunk (4 chunks of 7)
-    )
-    process_every = 7  # Process every 7 tokens (standard for Orpheus model)
+    model_index, _, _, _ = model_pool.get_model()
 
-    start_time = time.time()
-    last_log_time = start_time
-    token_count = 0
+    try:
+        # Use different thresholds for first chunk vs. subsequent chunks
+        first_chunk_processed = False
+        min_frames_first = (
+            7  # Process after just 7 tokens for first chunk (ultra-low latency)
+        )
+        min_frames_subsequent = (
+            49  # Default for reliability after first chunk (4 chunks of 7)
+        )
+        process_every = 7  # Process every 7 tokens (standard for Orpheus model)
 
-    async for token_text in token_gen:
-        token = turn_token_into_id(token_text, count)
-        if token is not None and token > 0:
-            # Add to buffer using simple append (reliable method)
-            buffer.append(token)
-            count += 1
-            token_count += 1
+        start_time = time.time()
+        last_log_time = start_time
+        token_count = 0
 
-            # Log throughput periodically
-            current_time = time.time()
-            if current_time - last_log_time > 5.0:  # Every 5 seconds
-                elapsed = current_time - start_time
-                if elapsed > 0:
-                    print(
-                        f"Token processing rate: {token_count/elapsed:.1f} tokens/second"
-                    )
-                last_log_time = current_time
+        async for token_text in token_gen:
+            token = turn_token_into_id(token_text, count)
+            if token is not None and token > 0:
+                # Add to buffer using simple append (reliable method)
+                buffer.append(token)
+                count += 1
+                token_count += 1
 
-            # Different processing paths based on whether first chunk has been processed
-            if not first_chunk_processed:
-                # For first audio output, process as soon as we have enough tokens for one chunk
-                if count >= min_frames_first:
-                    buffer_to_proc = buffer[-min_frames_first:]
-
-                    # Process the first chunk for immediate audio feedback
-                    print(
-                        f"Processing first audio chunk with {len(buffer_to_proc)} tokens"
-                    )
-                    audio_samples = convert_to_audio(buffer_to_proc, count)
-                    if audio_samples is not None:
-                        first_chunk_processed = True  # Mark first chunk as processed
-                        yield audio_samples
-            else:
-                # For subsequent chunks, use standard processing with larger batch
-                if count % process_every == 0 and count >= min_frames_subsequent:
-                    # Use simple slice operation - reliable and correct
-                    buffer_to_proc = buffer[-min_frames_subsequent:]
-
-                    # Debug output to help diagnose issues
-                    if count % 28 == 0:
+                # Log throughput periodically
+                current_time = time.time()
+                if current_time - last_log_time > 5.0:  # Every 5 seconds
+                    elapsed = current_time - start_time
+                    if elapsed > 0:
                         print(
-                            f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}"
+                            f"Token processing rate: {token_count/elapsed:.1f} tokens/second"
                         )
+                    last_log_time = current_time
 
-                    # Process the tokens
-                    audio_samples = convert_to_audio(buffer_to_proc, count)
-                    if audio_samples is not None:
-                        yield audio_samples
+                # Different processing paths based on whether first chunk has been processed
+                if not first_chunk_processed:
+                    # For first audio output, process as soon as we have enough tokens for one chunk
+                    if count >= min_frames_first:
+                        buffer_to_proc = buffer[-min_frames_first:]
+
+                        # Process the first chunk for immediate audio feedback
+                        print(
+                            f"Processing first audio chunk with {len(buffer_to_proc)} tokens"
+                        )
+                        audio_samples = convert_to_audio(
+                            buffer_to_proc, count, model_index
+                        )
+                        if audio_samples is not None:
+                            first_chunk_processed = (
+                                True  # Mark first chunk as processed
+                            )
+                            yield audio_samples
+                else:
+                    # For subsequent chunks, use standard processing with larger batch
+                    if count % process_every == 0 and count >= min_frames_subsequent:
+                        # Use simple slice operation - reliable and correct
+                        buffer_to_proc = buffer[-min_frames_subsequent:]
+
+                        # Debug output to help diagnose issues
+                        if count % 28 == 0:
+                            print(
+                                f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}"
+                            )
+
+                        # Process the tokens
+                        audio_samples = convert_to_audio(
+                            buffer_to_proc, count, model_index
+                        )
+                        if audio_samples is not None:
+                            yield audio_samples
+    finally:
+        model_pool.release_model(model_index)
 
 
 def tokens_decoder_sync(syn_token_gen, output_file=None):
@@ -555,15 +568,7 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
     audio_queue = queue.Queue(maxsize=queue_size)
     audio_segments = []
 
-    # If output_file is provided, prepare WAV file with buffered I/O
-    wav_file = None
-    if output_file:
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-        wav_file = wave.open(output_file, "wb")
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(SAMPLE_RATE)
+    yield create_wav_header(SAMPLE_RATE, 1, 2)
 
     # Batch processing of tokens for improved throughput
     batch_size = 32 if HIGH_END_GPU else 16
@@ -642,12 +647,12 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
 
     # Optimized I/O approach for all systems
     # This approach is simpler and more reliable than separate code paths
-    write_buffer = bytearray()
+    write_buffer = bytes()
     buffer_max_size = 1024 * 1024  # 1MB max buffer size (adjustable)
 
     # Keep track of the last time we checked for completion
     last_check_time = time.time()
-    check_interval = 1.0  # Check producer status every second
+    check_interval = 0.2  # Check producer status every second
 
     # Process audio chunks until we're done
     while True:
@@ -663,15 +668,15 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
 
             # Store the audio segment for return value
             audio_segments.append(audio)
+            yield audio
 
-            # Write to file if needed
-            if wav_file:
-                write_buffer.extend(audio)
+            # # Write to file if needed
+            # write_buffer += audio
 
-                # Flush buffer if it's large enough
-                if len(write_buffer) >= buffer_max_size:
-                    wav_file.writeframes(write_buffer)
-                    write_buffer = bytearray()  # Reset buffer
+            # # Flush buffer if it's large enough
+            # if len(write_buffer) >= buffer_max_size:
+            #     yield write_buffer
+            #     write_buffer = bytes()  # Reset buffer
 
         except queue.Empty:
             # No data available right now
@@ -686,10 +691,10 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
                     print("Producer done and queue empty - finishing consumer")
                     break
 
-                # Flush buffer periodically even if not full
-                if wav_file and len(write_buffer) > 0:
-                    wav_file.writeframes(write_buffer)
-                    write_buffer = bytearray()  # Reset buffer
+                # # Flush buffer periodically even if not full
+                # if len(write_buffer) > 0:
+                #     yield write_buffer
+                #     write_buffer = bytes()  # Reset buffer
 
     # Extra safety check - ensure thread is done
     if thread.is_alive():
@@ -698,16 +703,10 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
         if thread.is_alive():
             print("WARNING: Token processor thread did not complete within timeout")
 
-    # Final flush of any remaining data
-    if wav_file and len(write_buffer) > 0:
-        print(f"Final buffer flush: {len(write_buffer)} bytes")
-        wav_file.writeframes(write_buffer)
-
-    # Close WAV file if opened
-    if wav_file:
-        wav_file.close()
-        if output_file:
-            print(f"Audio saved to {output_file}")
+    # # Final flush of any remaining data
+    # if len(write_buffer) > 0:
+    #     print(f"Final buffer flush: {len(write_buffer)} bytes")
+    #     yield write_buffer
 
     # Calculate and print detailed performance metrics
     if audio_segments:
@@ -724,8 +723,6 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
             print("⚠️ Warning: Generation is slower than realtime")
         else:
             print(f"✓ Generation is {realtime_factor:.1f}x faster than realtime")
-
-    return audio_segments
 
 
 # def stream_audio(audio_buffer):
