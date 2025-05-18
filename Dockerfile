@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
     libsndfile1 \
-    # ffmpeg \
+    ffmpeg \
     # portaudio19-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

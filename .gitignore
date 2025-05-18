@@ -12,3 +12,12 @@ wheels/
 
 # Wav files
 *.wav
+
+# Opus files
+*.opus
+
+# Mp3 files
+*.mp3
+
+# FFmpeg files
+ffmpeg*

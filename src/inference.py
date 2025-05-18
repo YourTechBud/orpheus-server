@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -1102,6 +1103,131 @@ def main():
 
     print(f"Speech generation completed in {end_time - start_time:.2f} seconds")
     print(f"Audio saved to {output_file}")
+
+
+async def ffmpeg_opus_stream_generator(wav_audio_generator):
+    """
+    Takes a synchronous generator yielding WAV audio chunks (header first, then PCM data),
+    and yields Opus audio packets by piping through ffmpeg.
+    """
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-f",
+        "s16le",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-ac",
+        "1",
+        "-i",
+        "-",  # Input from stdin
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "64k",  # Opus bitrate
+        "-vbr",
+        "on",
+        "-application",
+        "audio",
+        "-f",
+        "opus",
+        "-",  # Output to stdout
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    async def feed_ffmpeg_input():
+        try:
+            # Consume and discard WAV header using asyncio.to_thread for the sync generator
+            header = await asyncio.to_thread(
+                lambda gen: next(gen, None), wav_audio_generator
+            )
+            if header is None:
+                print("Opus stream: WAV generator was empty or header missing.")
+                if process.stdin and not process.stdin.is_closing():
+                    process.stdin.close()
+                return
+            # print(f"Opus stream: Discarded WAV header ({len(header)} bytes) for ffmpeg.")
+
+            while True:
+                pcm_chunk = await asyncio.to_thread(
+                    lambda gen: next(gen, None), wav_audio_generator
+                )
+                if pcm_chunk is None:  # End of synchronous generator
+                    break
+
+                if process.stdin and not process.stdin.is_closing():
+                    try:
+                        process.stdin.write(pcm_chunk)
+                        await process.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        # ffmpeg process likely terminated
+                        # print("Opus stream: ffmpeg stdin broken pipe or connection reset.")
+                        break
+                else:
+                    # print("Opus stream: ffmpeg stdin closed or not available.")
+                    break
+        except Exception as e:
+            print(f"Opus stream: Error feeding PCM to ffmpeg: {e}")
+        finally:
+            if process.stdin and not process.stdin.is_closing():
+                process.stdin.close()
+
+    feeder_task = asyncio.create_task(feed_ffmpeg_input())
+
+    try:
+        while True:
+            opus_packet = await process.stdout.read(4096)  # Read in chunks
+            if not opus_packet:  # EOF from ffmpeg stdout
+                break
+            yield opus_packet
+    except Exception as e:
+        print(f"Opus stream: Error reading Opus from ffmpeg stdout: {e}")
+    finally:
+        # Ensure feeder task is complete
+        if not feeder_task.done():
+            feeder_task.cancel()  # Request cancellation
+            try:
+                await feeder_task  # Wait for feeder to finish or be cancelled
+            except asyncio.CancelledError:
+                # print("Opus stream: Feeder task was cancelled.")
+                pass
+            except Exception as e:
+                print(f"Opus stream: Exception in feeder task during cleanup: {e}")
+
+        # Handle ffmpeg process completion
+        if process.returncode is None:  # Process still running
+            # print("Opus stream: Terminating ffmpeg process.")
+            process.terminate()  # Ask ffmpeg to terminate
+            try:
+                # Wait for a short period for ffmpeg to terminate
+                _, stderr_output = await asyncio.wait_for(
+                    process.communicate(), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                # print("Opus stream: ffmpeg did not terminate gracefully, killing.")
+                process.kill()  # Force kill if it doesn't terminate
+                _, stderr_output = await process.communicate()  # Clean up
+            except Exception as e:  # Other errors during communicate
+                print(f"Opus stream: Error during ffmpeg communicate: {e}")
+                stderr_output = b""  # Ensure stderr_output is defined
+        else:  # Process already terminated
+            # print("Opus stream: ffmpeg process already terminated.")
+            # Read any remaining stderr
+            stderr_output = await process.stderr.read() if process.stderr else b""
+
+        if stderr_output:
+            print(f"ffmpeg stderr: {stderr_output.decode(errors='ignore')}")
+
+        if process.returncode != 0 and process.returncode is not None:
+            print(f"ffmpeg process exited with code {process.returncode}")
+        # print("Opus stream: ffmpeg_opus_stream_generator finished.")
 
 
 if __name__ == "__main__":
